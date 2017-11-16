@@ -1,0 +1,373 @@
+#!/usr/bin/perl
+# Name: Kenneth High
+# Username: khigh
+#$Id: pmake.perl, v 1.1 2015-11-28 22:16:07-07 - - $
+
+#
+# NAME
+#    pmake.perl - parses and executes shell scripts
+#                 modeled after make(1)
+#
+# SYNOPSIS
+#    pmake.perl [-dnf] [filename...]
+#
+# OPTIONS
+#    -d debug, prints reasons for rebuilding a target to stdin
+#    -n Non-execution, prints commands without executing them
+#    -f specifies which file to execute, if no file is specified
+#       then use ./Makefile. exit(1) if no file is opened
+#
+
+# setup
+use strict;
+use warnings;
+use Getopt::Std;
+
+#setup error handeling
+$0 =~ s|.*/||;
+my $status = 0;
+END { exit $status; }
+$SIG{__WARN__} = sub {print STDERR "$0: @_"; $status = 1};
+$SIG{__DIE__} = sub {warn @_; $status = 1; exit};
+
+# parse options
+my %opts;
+getopts "dnf", \%opts;
+
+my $first_target;
+my @instructions;
+my @finished_targets;
+my %target_table;
+my %instruction_table;
+my %macro_table;
+my @wildcard = ();
+my $card = "";
+my $ignore = 0;
+
+sub exec_target($);
+
+# store command line arguments, 
+# store a "-" as placeholder if no args are given
+push @ARGV, "-" unless @ARGV;
+
+sub trans_macro($){
+    my ($line) = @_;
+    while( $line =~ /^.*\${[^}]+}.*$/){
+       my ($macro) = $line =~ /.*(\${[^}]+}).*/; 
+       ($macro) = $macro =~ /\${([^}]+)}/;
+       my ($pre) = $line =~ /(.*)\${[^}]+}.*/;
+       my ($post) = $line =~ /.*\${[^}]+}(.*)/;
+       my $content = $macro_table{$macro};
+       if(not @$content){}
+       else{$macro = join(' ',@$content);}
+       $line = $pre . $macro . $post;
+    }
+    return $line;
+}
+
+# a subroutine to help parse dependancies
+# to be called when we are building our hashtable for holding targets
+# and their prerequisites + commands.
+# Takes in a string, if the string is such that it is composed of 
+# one string a ":" and another string, then parse this such that the 
+# first string becomes the target and the second becomes 
+# the string array of dependencies
+#
+# Args: one scalar, representing an input string
+#
+# Output: a pair of a string and an array of strings, 
+#    the first representing the target, the second, the dependencies
+#
+# Pre-conditions: None
+#
+# Pitfalls: There is no error handling or special case if 
+# the input scalar is not a string, the subroutine will only 
+# return undef, it will not print an error or exit gracefully
+sub parse_dep ($) {
+   my ($line) = @_;
+   return undef unless $line =~ m/^(\S+)\s*:\s*(.*?)\s*$/;
+   my ($target, $dependency) = ($1, trans_macro$2);
+   my @dependencies = split m/\s+/, $dependency;
+   return $target, \@dependencies;
+}
+
+# a subroutine to help store lists of instructions as values of 
+# a hashtable by returning the passed in array as a reference
+#
+# Args: an array (not specified but that's the intent)
+#
+# Output: A refrence to a list containing the Args
+#
+# Pre-conditions: None.
+#
+# Pitfalls: There is no error handling in case no input is given,
+# which could cause 'uninitialized error' problems for other processes.
+# There is also no check to make sure the args given are the array we 
+# expect.
+sub inst_val {
+    my @list = @_;
+    return \@list;
+}
+
+sub exec_target($){
+    my ($target) = @_;
+    print "
+Considering target file \'$target\'." if $opts{'d'};
+# check for file $target here
+    print "
+ File \'$target\' does not exist.
+" if $opts{'d'};
+    if(exists $target_table{$target}){
+       for my$targ (@finished_targets){
+           return if ($targ eq $target);
+       }
+       my $deps = $target_table{$target};
+       if(not @$deps){}
+       else{
+          exec_target(trans_macro($_)) for @$deps;
+       }
+       print "
+ Finished prerequisites of target file \'$target\'.
+Must remake target \'$target\'.
+" if $opts{'d'};
+       if (exists $instruction_table{$target}){
+          my $inst = $instruction_table{$target};
+          if(not @$inst){}
+          else{
+             for my $cmd (@$inst){
+                my $reset_cmd = $cmd;
+                ($cmd) = $cmd =~ /-\s(.*)/ and $ignore = 1 
+                      unless not $cmd =~ /^-\s.*$/;
+                while($cmd =~ /.*\$<.*/){
+                   my ($pre) = $cmd =~ /(.*)\$<.*/;
+                   my ($post) = $cmd =~ /.*\$<(.*)/;
+                   if(@$deps[0]=~/.*%.*/){
+                       my($suffix)= @$deps[0]=~/.*%(.*)/;
+                       $cmd = $pre . $card . $suffix . $post;
+                   }
+                   else{$cmd = $pre . @$deps[0] . $post;}
+                }
+                while($cmd =~ /.*\$@.*/){
+                   my ($pre) = $cmd =~ /(.*)\$@.*/;
+                   my ($post) = $cmd =~ /.*\$@(.*)/;
+                   $cmd = $pre . $target . $post;
+                }
+                $cmd = trans_macro($cmd);
+                # check for $$ which should translate to $ here
+                while($cmd =~ /.*\$\$.*/){
+                   my ($pre) = $cmd =~ /(.*)\$\$.*/;
+                   my ($post) = $cmd =~ /.*\$\$(.*)/;
+                   $cmd = $pre . "\$" . $post;
+                }
+                print "$cmd\n";
+                system "$cmd" if not $opts{'n'};
+                $cmd = $reset_cmd;
+             }
+             push @finished_targets, $target unless $target =~ /.*%.*/;
+ 
+             # check for exit status from system here ($?)
+             # unless there was a '- ' at the beginning of the command
+             my $term_signal = $? & 0x7F;
+             my $core_dumped = $? & 0x80;
+             my $exit_status = ($? >> 8) & 0xFF;
+             if($exit_status != 0){
+                 my $true_target = $target;
+                 if($target=~/.*%.*/){
+                    my($suffix)= $target=~/.*%(.*)/;
+                    $true_target = $card . $suffix;
+                 }
+                 print "make: *** [$true_target] Error $exit_status\n" 
+                    unless $ignore == 1;
+                 print "make: [$true_target]",
+                    " Error $exit_status (ignored)",
+                    "\n" if $ignore == 1;
+                 exit unless $ignore == 1;
+             }
+             $ignore =0;
+          }
+       }
+    $card = "";
+    print "
+Successfully remade target file \'$target\'." if $opts{'d'};
+    }
+    for my$targ (@finished_targets){
+       return if ($targ eq $target);
+    }
+    # check for '%' matches
+    unless($target=~/.*%.*/){
+       for my$wild (@wildcard){
+          my($post) = $wild =~ /.*%(.*)/;
+          $post= "\\" . $post;
+          ($card) = $target =~ /(.*)$post/ if $target =~ /(.+)$post/;
+          exec_target($wild) if ($target=~$card and $target=~$post);
+       }
+    }
+}
+
+# main
+
+# if '-f' is specified w/o argument, exit
+if($opts{'f'} and $ARGV[0] eq "-") {
+   warn "option requires an argument -- 'f'
+Usage: make [options] [target] ...$!\n";
+}
+else {
+   # if '-f' is specified then set the filename to the given argument
+   # otherwise, use Makefile
+   my $filename = ($opts{'f'} and !($ARGV[0] eq "-"))? 
+                  shift @ARGV:"Makefile";
+   if(($filename eq "Makefile")){
+      if($ARGV[0] eq "-"){ pop @ARGV;}
+   }
+
+# debug print
+print __FILE__."
+No Rights Reserved.
+This software was made for Prof. Mackey's CMPS112 class
+at University of California Santa Cruz in November of 2015.
+
+Reading makefiles...
+Reading makefile \'$filename\'...
+Updating makefiles....
+ Considering target file \'$filename\'.
+  No implicit rule found for \'$filename\'.
+  Finished prerequisites of target file \'$filename\'.
+ Must remake target \'$filename\'." if $opts{'d'};
+
+   # open the specified file, if it fails to open, kill the process
+   open my $file, "<$filename" or die "$filename: $!\n";
+
+# debug print
+print "
+ Successfully remade target file \'$filename\'.
+Updating goal targets...." if $opts{'d'};
+
+   # Store Macros, targets and dependencies/instructions in the 
+   # appropriate tables for execution
+   my $prev_target = "dummy";# this dummy value is to prevent an 
+                             # 'uninitialized variable error'
+                             # the downside is we are prevented from
+                             # executing a makefile w/ target 'dummy'
+   while (defined (my $line = <$file>)){
+      chomp $line;
+      # skip any lines that are commented (start with #) 
+      # or blank (length = 0)
+      next unless not ($line =~ /\s*#.*/) and (length $line != 0);
+      # parse the line to find if it is a target:dependencies
+      my ($target, $deps) = parse_dep $line;
+      # if it isn't then push it onto the macros table
+      # if it fits MACRONAME = CONTENTS
+      if($line =~ /[A-Z]+\s+=\s.+/){
+         my ($macro) = $line =~ /([A-Z]+)\s+=/;
+         my ($contents) = $line =~ /=\s(.+)/;
+         my @con = split(' ',$contents);
+         my $cont = inst_val(@con);
+         $macro_table{$macro}=$cont and next;
+      }
+      # if it isn't then push it onto the instructions array
+      my ($line) = $line =~ /\t(.*)/ unless not $line =~ /^\t+.*$/;
+      push @instructions,$line and next unless defined $target;
+      # on the first runthrough of the loop, prev_target == "dummy"
+      # so we store everything discovered up to that point as MACROS
+      # all iterations afterwards, we store as instructions
+      if ( ($prev_target =~ "dummy")){
+         $first_target = $target;
+      }
+      else{
+         # store all the instructions we've gathered with the 
+         # target they should be associated with
+         my $inst = inst_val(@instructions);
+         $instruction_table{trans_macro($prev_target)} = $inst;
+      }
+      # otherwise, store the target and dependencies in the hashtable
+      $target_table{trans_macro($target)} = $deps;
+      # update prev_target so that we can store instructions there next
+      $prev_target = $target;
+      # empty instructions, so that we don't mistakenly store 
+      # old instructions in the new target
+      @instructions = ();
+      # allot '%' array here
+      if(scalar @wildcard != 0){
+         for my$wild (@wildcard){
+            if($wild eq $target){next;}
+            push @wildcard, $target if $target =~ /.*%.*/;
+         }
+      }
+      else{
+         push @wildcard, $target if $target =~ /.*%.*/;
+      }
+   }
+   # we need to store the last set of instructions with the last target
+   # since the loop ended before we could do so normally
+   my $inst = inst_val(@instructions);
+   $instruction_table{trans_macro($prev_target)} = $inst;
+
+   # we're done with the input file now
+   close $file;
+
+   # create an array to store the targets we need to run
+   # if there are no targets supplied by the command line
+   # run the first target to appear in the script
+   my @targets;
+   @targets = @ARGV;
+   if ((scalar @targets) == 0){
+      push @targets, $first_target;
+   }
+
+   while (scalar @targets != 0){
+      my $target = shift @targets;
+      exec_target($target);
+   }
+
+# # print all the target:dependencies
+# for my $target (keys %target_table) {
+#    print "\"$target\"";
+#    my $deps = $target_table{$target};
+#    if (not @$deps) {
+#       print " has no dependencies";
+#    }else {
+#       print " depends on";
+#       print " \"$_\"" for @$deps;
+#    }
+#    print "\n";
+# }
+# print "\n";
+# #print the instructions accosiated with each target
+# for my $target (keys %instruction_table) {
+#    print "\"$target\"";
+#    my $instructions = $instruction_table{$target};
+#    if (not @$instructions) {
+#        print " contains no instructions";
+#     }else {
+#        print " contains ";
+#        print " \"$_\"" for @$instructions;
+#     }
+#    print "\n";
+# }
+# print "\n";
+# #print the contents accosiated with each macro
+# for my $macro (keys %macro_table) {
+#    print "\"$macro\"";
+#    my $contents = $macro_table{$macro};
+# #   print $contents;
+#     if (not @$contents) {
+#         print " contains no contents";
+#      }else {
+#         print " contains ";
+#         print " \"$_\"" for @$contents;
+#      }
+#    print "\n";
+# }
+#   print "\n";
+# print @wildcard,"\n";
+
+# TO-DO
+# 
+# check if dependency is a file and get its timestamp
+# compare this to the timestamp of the target being evaluated,
+# if the target is older than the dependency execute the instructions
+# if no dependency is younger than the target, skip instructions
+# and print 'up to date'
+#
+# handle error codes returned by system, unless command starts with '- '
+}
